@@ -5,244 +5,252 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-#ifndef TC_ACT_OK
 #define TC_ACT_OK 0
-#endif
-
-#ifndef ETH_P_IP
+#define TC_ACT_SHOT 2
 #define ETH_P_IP 0x0800
-#endif
 
 char _license[] SEC("license") = "GPL";
 
-struct ip_port_key
-{
-	__u32 dest_ip;
-	__u16 dest_port;
-	__u16 padding;
+/* --- [전역 변수: 유저 영역에서 실시간 업데이트] --- */
+// 현실 세계의 시각(Hour) 정보를 공유받음
+volatile const __u32 current_hour = 0; 
+
+/* --- [데이터 구조체 정의] --- */
+
+// 1. 주소록 조회용 키
+struct ip_port_key {
+    __u32 dest_ip;
+    __u16 dest_port;
+    __u16 padding;
 };
 
-struct process_info_value
-{
-	__u32 pid;
-	__u32 tid;
-	char comm[16];	// process name
+// 2. 프로세스 기본 정보
+struct process_info_value {
+    __u32 pid;
+    __u32 tid;
+    char comm[16];
 };
 
-struct stats_key
-{
-	__u32 pid;
-	__u32 dest_ip;
-	__u16 dest_port;
-	__u16 padding;	
+// 3. 통계 및 정책 공용 키 (PID + 목적지 세션)
+struct stats_key {
+    __u32 pid;
+    __u32 dest_ip;
+    __u16 dest_port;
+    __u16 padding;  
 };
 
-struct stats_info
-{
-	char comm[16];
-	__u64 packet_count;
-	__u64 total_bytes;
-	__u64 total_sq_bytes;
-	__u64 last_packet_ts;
-	__u64 interval_sum;
-	__u32 max_packet_size;
-	__u32 byte_frequency[8];	
+// 4. [5대 정책 항목 반영] 프로세스별 세부 정책
+struct process_policy {
+    // 항목 1 & 2: 전송량 및 빈도 (Throughput/Frequency)
+    __u64 max_bytes_per_sec;    
+    __u64 max_packet_size;      // 평균 + 3시그마 임계치
+    __u32 max_packets_per_sec;  
+
+    // 항목 3: 신뢰 상태 (Trust Level)
+    __u8  trust_level;          // 0:Black, 1:Gray, 2:White
+    __u8  is_new_destination;
+
+    // 항목 4: 시간 제약 (Temporal Constraint)
+    __u32 allowed_start_hour;
+    __u32 allowed_end_hour;
+
+    // 항목 5: 샘플링 트리거 (Sampling Rate)
+    __u32 sample_rate;
+
+    // [커널 관리용 실시간 상태]
+    __u64 current_window_bytes;
+    __u32 current_window_packets;
+    __u64 last_window_ts;       // 1초 단위 갱신 기준
 };
 
-struct 
-{
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 10240);
-	__type(key, struct stats_key);
-	__type(value, struct stats_info);
+// 5. 정밀 분석용 통계 가계부
+struct stats_info {
+    char comm[16];
+    __u64 packet_count;
+    __u64 total_bytes;
+    __u64 total_sq_bytes;
+    __u64 last_packet_ts;
+    __u64 interval_sum;
+    __u32 max_packet_size;
+    __u32 byte_frequency[8];
+};
+
+// 6. [최종 반영] 유저 영역 보고용 이벤트 (페이로드 스냅샷 포함)
+struct event_t {
+    __u32 pid;
+    __u32 uid;
+    char comm[16];
+    
+    __u32 saddr;
+    __u32 daddr;
+    __u16 sport;
+    __u16 dport;
+    
+    __u32 reason;       // 1:신뢰도, 2:크기초과, 3:전송량/빈도, 4:시간외, 5:샘플링
+    __u32 packet_len;
+    
+    char payload[128];  // [핵심] 패킷 앞부분 128바이트 스냅샷
+};
+
+/* --- [BPF 맵 정의] --- */
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10240);
+    __type(key, struct stats_key);
+    __type(value, struct stats_info);
 } map_stats SEC(".maps");
 
-struct
-{
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 1024);
-	__type(key, struct ip_port_key);
-	__type(value, struct process_info_value);
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, struct ip_port_key);
+    __type(value, struct process_info_value);
 } map_process SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10240);
+    __type(key, struct stats_key);
+    __type(value, struct process_policy);
+} map_policy SEC(".maps");
 
-SEC("kprobe/tcp_sendmsg")
-int bpf_prog_tcp_sendmsg(struct pt_regs *ctx)
-{
-	// tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
-	// kprobe는 어떤 함수가 실행될 때, CPU register 값을 가져온다. 
-	// 함수의 파라메타가 sk, msg, size이므로, 이들은 x86-64 기준 
-	// %rdi, %rsi, ... 에 저장이 되고, 이 register 값들의 정보를 가져온다. 
-	// PT_REGS_PARM1은 첫번째 register의 값을 가져오는데 이것이 socket 정보.
-	struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
-	if (!sk)
-		return 0;
-	
-	// key와 value 구조체를 다 0으로 초기화
-	struct ip_port_key key = {};
-	struct process_info_value val = {};
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 512 * 1024); // 페이로드 복사를 위해 용량 상향
+} rb SEC(".maps");
 
-	// PID, TID 추출
-	// 상위 32비트: TGID (process ID)
-	// 하위 32비트: PID (Thread ID)
-	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	val.pid = pid_tgid >> 32;
-	val.tid = (__u32)pid_tgid;
+/* --- [헬퍼 함수: 이벤트 전송 및 페이로드 복사] --- */
 
-	// 프로세스 이름 추
-	bpf_get_current_comm(&val.comm, sizeof(val.comm));
+static __always_inline void send_to_user(struct __sk_buff *skb, struct process_info_value *proc, struct stats_key *key, __u32 reason, __u32 payload_offset, __u32 saddr, __u16 sport) {
+    struct event_t *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
+    if (!e) return;
 
-	// destination port 추출
-	// struct sk 구조체는 TCP 연결 상태, 송신 큐, 윈도우 크기 등의 정보들을 가지고 있다. 
-	// sk->__sk_common에 IP와 port 정보들이 저장되어 있다. 
-	// sk->__sk_common.skc_daddr: dest IP
-	// sk->__sk_common.skc_dport: dest port
-	__u16 dport = 0;
-	bpf_probe_read_kernel(&dport, sizeof(dport), &sk->__sk_common.skc_dport);
-	key.dest_port = bpf_ntohs(dport);
+    e->pid = proc->pid;
+    e->uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    __builtin_memcpy(e->comm, proc->comm, 16);
+    
+    e->saddr = saddr; e->sport = sport;
+    e->daddr = key->dest_ip; e->dport = key->dest_port;
+    
+    e->reason = reason;
+    e->packet_len = skb->len;
 
-	// destination IP 추출
-	bpf_probe_read_kernel(&key.dest_ip, sizeof(key.dest_ip), &sk->__sk_common.skc_daddr);
+    // 패킷에서 실제 데이터(Payload) 128바이트 복사
+    __builtin_memset(e->payload, 0, 128);
+    __u32 copy_len = skb->len - payload_offset;
+    if (copy_len > 0) {
+        if (copy_len > 128) copy_len = 128;
+        bpf_skb_load_bytes(skb, payload_offset, e->payload, copy_len);
+    }
 
-	// map에 저장
-	bpf_map_update_elem(&map_process, &key, &val, BPF_ANY);
-	
-	return 0;
+    bpf_ringbuf_submit(e, 0);
 }
+
+/* --- [메인 로직: TC 훅] --- */
 
 SEC("tc")
-int bpf_tc_egress(struct __sk_buff *skb)
-{
-	// TC Hook에서 sk_buff 구조체를 입력 파라메타로 가져옴
-	// data_end는 패킷의 끝 주소를 의미
-	// data는 패킷의 시작점을 의미
-	void *data_end = (void *)(long)skb->data_end;
-	void *data = (void *)(long)skb->data;
+int bpf_tc_egress(struct __sk_buff *skb) {
+    void *data_end = (void *)(long)skb->data_end;
+    void *data = (void *)(long)skb->data;
 
-	struct ethhdr *eth = data;
-	// 이더넷 헤더 부분의 끝부분이 패킷 전체 길이보다 바깥에 위치하는 불량 패킷
-	// 포인터를 사용하는데, verifier가 메모리 경계 검사를 하기 때문에 필요
-	if ((void*)(eth + 1) > data_end)
-		return TC_ACT_OK;
-	// IPv4만 골라서 하기
-	if (eth->h_proto != bpf_htons(ETH_P_IP))
-		return TC_ACT_OK;
-	
-	// 패킷 구조:[ethenet header][IP header][TCP/UDP header][Payload]
-	// 아래는 지금 IP header의 시작 주소를 설정한 것
-	struct iphdr *ip = (void *)(eth +1);
-	if ((void *)(ip + 1) > data_end)
-		return TC_ACT_OK;
+    // 1. 헤더 분석 (L3, L4)
+    struct ethhdr *eth = data;
+    if ((void*)(eth + 1) > data_end) return TC_ACT_OK;
+    if (eth->h_proto != bpf_htons(ETH_P_IP)) return TC_ACT_OK;
+    struct iphdr *ip = (void *)(eth + 1);
+    if ((void *)(ip + 1) > data_end) return TC_ACT_OK;
 
-	// map_process_track에서 해당 IP, port를 찾아야 되는데 그때 사용할 lookup_key를 설정
-	struct ip_port_key lookup_key = {};
-	lookup_key.dest_ip = ip->daddr;
+    __u32 saddr = ip->saddr;
+    __u32 daddr = ip->daddr;
+    __u16 sport = 0, dport = 0;
+    __u32 payload_offset = sizeof(struct ethhdr) + (ip->ihl * 4);
 
-	__u32 payload_offset = sizeof(struct ethhdr) + (ip->ihl * 4);
+    if (ip->protocol == IPPROTO_TCP) {
+        struct tcphdr *tcp = (void *)(ip + 1);
+        if ((void *)(tcp + 1) > data_end) return TC_ACT_OK;
+        sport = bpf_ntohs(tcp->source); dport = bpf_ntohs(tcp->dest);
+        payload_offset += (tcp->doff * 4);
+    } else if (ip->protocol == IPPROTO_UDP) {
+        struct udphdr *udp = (void *)(ip + 1);
+        if ((void *)(udp + 1) > data_end) return TC_ACT_OK;
+        sport = bpf_ntohs(udp->source); dport = bpf_ntohs(udp->dest);
+        payload_offset += sizeof(struct udphdr);
+    } else return TC_ACT_OK;
 
-	// TCP인 경우 lookup_key의 port와 payload_offset을 갱신
-	if (ip->protocol == IPPROTO_TCP)
-	{
-		struct tcphdr *tcp = (void *)(ip + 1);
-		if ((void *)(tcp + 1) > data_end)
-			return TC_ACT_OK;
-		lookup_key.dest_port = bpf_ntohs(tcp->dest);
-		payload_offset += (tcp->doff * 4);
-	}
-        // UPD인 경우 	
-	else if(ip->protocol == IPPROTO_UDP)
-	{
-		struct udphdr *udp = (void *)(ip + 1);
-		if ((void *)(udp + 1) > data_end)
-			return TC_ACT_OK;
-		lookup_key.dest_port = bpf_ntohs(udp->dest);
-		payload_offset += sizeof(struct udphdr);
-	}
-	else
-	{
-		return TC_ACT_OK;
-	}
+    // 2. 프로세스 식별
+    struct ip_port_key lookup_key = { .dest_ip = daddr, .dest_port = dport };
+    struct process_info_value *proc_info = bpf_map_lookup_elem(&map_process, &lookup_key);
+    if (!proc_info) return TC_ACT_OK;
 
-	// lookup_key를 통해 map_process에서 해당 정보를 찾는다
-	// map_process의 value는 pid, tid, comm이 존재 
-	struct process_info_value *proc_info = bpf_map_lookup_elem(&map_process, &lookup_key);
-	if (!proc_info)
-		return TC_ACT_OK;
+    struct stats_key s_key = { .pid = proc_info->pid, .dest_ip = daddr, .dest_port = dport };
 
-	// map_stats의 key 생성
-	struct stats_key s_key = {};
-        s_key.pid = proc_info->pid;
-	s_key.dest_ip = lookup_key.dest_ip;
-	s_key.dest_port = lookup_key.dest_port;
+    // 3. [정책 분석 엔진 가동]
+    struct process_policy *policy = bpf_map_lookup_elem(&map_policy, &s_key);
+    if (policy) {
+        // [A] 블랙리스트 필터링
+        if (policy->trust_level == 0) return TC_ACT_SHOT;
 
-	// 패킷의 길이
-	// 패킷 TC hook 지나간 시점
-	__u32 pkt_len = skb->len;
-	__u64 now_ts = bpf_ktime_get_ns();
-	
-	// map_stats에서 s_key를 통해 map에 이미 있는지, 없는지를 판단
-	struct stats_info *stats = bpf_map_lookup_elem(&map_stats, &s_key);
-	
-	// map_stats에 이미 해당 key가 존재하는 경우, value 정보 갱신
-	if (stats)
-	{
-		__sync_fetch_and_add(&stats->packet_count, 1);
-		__sync_fetch_and_add(&stats->total_bytes, pkt_len);
-		__sync_fetch_and_add(&stats->total_sq_bytes, (__u64)pkt_len * pkt_len);
-		
-		if (now_ts > stats->last_packet_ts)
-		{
-			__sync_fetch_and_add(&stats->interval_sum, (now_ts - stats->last_packet_ts));
-		}
-		stats->last_packet_ts = now_ts;
-		
-		if (pkt_len > stats->max_packet_size)
-		{
-			stats->max_packet_size = pkt_len;
-		}
-	}
-	// map_stats에 해당 key가 없는 경우, 새로 추가
-	else
-	{
-		// comm 정보 갱신
-		struct stats_info new_stats = {};
-		__builtin_memcpy(new_stats.comm, proc_info->comm, sizeof(new_stats.comm));
-		
-		new_stats.packet_count = 1;
-		new_stats.total_bytes = pkt_len;
-		new_stats.total_sq_bytes = (__u64)pkt_len * pkt_len;
-		new_stats.last_packet_ts = now_ts;
-		new_stats.interval_sum = 0;
-		new_stats.max_packet_size = pkt_len;
+        // [B] 실시간 윈도우 계산
+        __u64 now = bpf_ktime_get_ns();
+        if (now - policy->last_window_ts >= 1000000000ULL) {
+            policy->current_window_bytes = 0;
+            policy->current_window_packets = 0;
+            policy->last_window_ts = now;
+        }
+        __sync_fetch_and_add(&policy->current_window_packets, 1);
 
+        // [C] 샘플링 트리거 (Level 2여도 수행)
+        if (policy->sample_rate > 0 && (policy->current_window_packets % policy->sample_rate == 0)) {
+            send_to_user(skb, proc_info, &s_key, 5, payload_offset, saddr, sport);
+        }
 
-		bpf_map_update_elem(&map_stats, &s_key, &new_stats, BPF_ANY);
+        // [D] 시간 제약 필터링
+        if (policy->allowed_start_hour != policy->allowed_end_hour) {
+            if (current_hour < policy->allowed_start_hour || current_hour >= policy->allowed_end_hour) {
+                send_to_user(skb, proc_info, &s_key, 4, payload_offset, saddr, sport);
+                return TC_ACT_SHOT;
+            }
+        }
 
-		stats = bpf_map_lookup_elem(&map_stats, &s_key);
-		if (!stats)
-			return TC_ACT_OK;
-	}
+        // [E] 신뢰 상태 분기
+        if (policy->trust_level == 2) goto collect_stats;
 
-	// byte_frequency[8]을 설정하는 곳. 
-	// 여기서는 packet의 payload를 시작으로 첫 64비트를 8개로 나누어 frequency 계산
-	// 질문: byte frequency의 시작점을 어디로 해야 좋을까요?
-	// 각 패킷마다 해당 bucket에 ++을 하므로 해킷이 지나갈 때마다 누적이 된다. 
-	#pragma unroll
-	for (int i = 0; i < 64; i++)
-	{
-		if (payload_offset + i < skb->len)
-		{
-			__u8 byte_val = 0;
-			bpf_skb_load_bytes(skb, payload_offset + i, &byte_val, 1);
-			int bucket = byte_val / 32;
-			stats->byte_frequency[bucket & 7]++;		
-		}
-	}
+        // [F] 의심 상태 정밀 필터링
+        if (policy->trust_level == 1) {
+            // 크기(3시그마) 체크
+            if (policy->max_packet_size > 0 && skb->len > policy->max_packet_size) {
+                send_to_user(skb, proc_info, &s_key, 2, payload_offset, saddr, sport);
+                return TC_ACT_SHOT;
+            }
+            // 빈도/전송량 체크
+            if (policy->max_packets_per_sec > 0 && policy->current_window_packets > policy->max_packets_per_sec) {
+                send_to_user(skb, proc_info, &s_key, 3, payload_offset, saddr, sport);
+                return TC_ACT_SHOT;
+            }
+            policy->current_window_bytes += skb->len;
+            if (policy->max_bytes_per_sec > 0 && policy->current_window_bytes > policy->max_bytes_per_sec) {
+                send_to_user(skb, proc_info, &s_key, 3, payload_offset, saddr, sport);
+                return TC_ACT_SHOT;
+            }
+        }
+    }
 
-	return TC_ACT_OK;
+collect_stats:
+    // 4. 정보 수집 및 가계부 작성
+    struct stats_info *stats = bpf_map_lookup_elem(&map_stats, &s_key);
+    if (stats) {
+        __sync_fetch_and_add(&stats->packet_count, 1);
+        __sync_fetch_and_add(&stats->total_bytes, skb->len);
+        __sync_fetch_and_add(&stats->total_sq_bytes, (__u64)skb->len * skb->len);
+        
+        #pragma unroll
+        for (int i = 0; i < 64; i++) {
+            if (payload_offset + i < skb->len) {
+                __u8 bv = 0; bpf_skb_load_bytes(skb, payload_offset + i, &bv, 1);
+                __sync_fetch_and_add(&stats->byte_frequency[(bv / 32) & 7], 1);
+            }
+        }
+    }
+    return TC_ACT_OK;
 }
-
-
-
-
-
