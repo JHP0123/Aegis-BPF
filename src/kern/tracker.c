@@ -191,7 +191,7 @@ int bpf_tc_egress(struct __sk_buff *skb) {
         // [A] 블랙리스트 필터링
         if (policy->trust_level == 0) return TC_ACT_SHOT;
 
-        // [B] 실시간 윈도우 계산
+        //  1초당 (실시간) 윈도우 저장 (크기 및 개수)
         __u64 now = bpf_ktime_get_ns();
         if (now - policy->last_window_ts >= 1000000000ULL) {
             policy->current_window_bytes = 0;
@@ -200,12 +200,12 @@ int bpf_tc_egress(struct __sk_buff *skb) {
         }
         __sync_fetch_and_add(&policy->current_window_packets, 1);
 
-        // [C] 샘플링 트리거 (Level 2여도 수행)
+        // 샘플링 단위로 가져오기 (Level 2여도 수행)
         if (policy->sample_rate > 0 && (policy->current_window_packets % policy->sample_rate == 0)) {
             send_to_user(skb, proc_info, &s_key, 5, payload_offset, saddr, sport);
         }
 
-        // [D] 시간 제약 필터링
+        // 1. 필터링:  시간 제약 필터링
         if (policy->allowed_start_hour != policy->allowed_end_hour) {
             if (current_hour < policy->allowed_start_hour || current_hour >= policy->allowed_end_hour) {
                 send_to_user(skb, proc_info, &s_key, 4, payload_offset, saddr, sport);
@@ -218,16 +218,17 @@ int bpf_tc_egress(struct __sk_buff *skb) {
 
         // [F] 의심 상태 정밀 필터링
         if (policy->trust_level == 1) {
-            // 크기(3시그마) 체크
+            // 2. 필터링 : 크기(3시그마) 체크
             if (policy->max_packet_size > 0 && skb->len > policy->max_packet_size) {
                 send_to_user(skb, proc_info, &s_key, 2, payload_offset, saddr, sport);
                 return TC_ACT_SHOT;
             }
-            // 빈도/전송량 체크
+            // 3. 필터링 : 1초당 빈도량 체크
             if (policy->max_packets_per_sec > 0 && policy->current_window_packets > policy->max_packets_per_sec) {
                 send_to_user(skb, proc_info, &s_key, 3, payload_offset, saddr, sport);
                 return TC_ACT_SHOT;
             }
+            // 4. 필터링 : 1초당 전송량 체크
             policy->current_window_bytes += skb->len;
             if (policy->max_bytes_per_sec > 0 && policy->current_window_bytes > policy->max_bytes_per_sec) {
                 send_to_user(skb, proc_info, &s_key, 3, payload_offset, saddr, sport);
