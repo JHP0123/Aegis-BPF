@@ -39,7 +39,7 @@ struct stats_key {
     __u16 padding;  
 };
 
-// 4. [5대 정책 항목 반영] 프로세스별 세부 정책
+// 4.프로세스별 세부 정책
 struct process_policy {
     // 항목 1 & 2: 전송량 및 빈도 (Throughput/Frequency)
     __u64 max_bytes_per_sec;    
@@ -63,7 +63,7 @@ struct process_policy {
     __u64 last_window_ts;       // 1초 단위 갱신 기준
 };
 
-// 5. 정밀 분석용 통계 가계부
+// 5. 정밀 분석용 통계부
 struct stats_info {
     char comm[16];
     __u64 packet_count;
