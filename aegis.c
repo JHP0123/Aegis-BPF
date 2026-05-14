@@ -18,11 +18,8 @@
 // ---------------------------------------------------------
 // [전역 변수 및 시그널 핸들러]
 // ---------------------------------------------------------
-static volatile sig_atomic_t stop = 0;
-
-static void sig_handler(int sig) {
-    stop = 1;
-}
+static volatile bool stop = false;
+static void sig_handler(int sig) { stop = true; }
 
 // 헥스 덤프 헬퍼 함수 (페이로드 시각화)
 void print_hex_dump(const char *payload, int len) {
@@ -121,46 +118,106 @@ void sync_security_policies(struct aegis_bpf *skel) {
     struct stats_info s_val;
     struct process_policy p_val;
 
+    //데이터가 충분히 쌓여있지 않을때 처리
     while (bpf_map_get_next_key(stats_fd, &cur_key, &next_key) == 0) {
         cur_key = next_key;
         if (bpf_map_lookup_elem(stats_fd, &cur_key, &s_val) != 0) continue;
 
-        // 1. 해당 세션의 현재 정책 확인
         if (bpf_map_lookup_elem(policy_fd, &cur_key, &p_val) != 0) {
-            // 정책이 없다면 새로 생성 (is_new_destination = 1로 시작)
             memset(&p_val, 0, sizeof(p_val));
-            p_val.trust_level = 2;          // [중요] 일단 무조건 허용(White)
-            p_val.is_new_destination = 1;   // "현재 학습 중" 표시
-            p_val.sample_rate = 10;         // 학습을 위해 샘플링 빈도를 높임
+            p_val.trust_level = 2;          
+            p_val.is_new_destination = 1;   
+            p_val.sample_rate = 10;         
             bpf_map_update_elem(policy_fd, &cur_key, &p_val, BPF_ANY);
             continue;
         }
 
-        // 2. [학습 종료 판정] 데이터가 충분히 쌓였는가? (예: 패킷 30개 이상)
-        if (p_val.is_new_destination == 1 && s_val.packet_count >= 30) {
+        // [학습 종료및 1,000개 패킷 단위로 map_stats 초기화]
+        bool should_update = false;
+        bool is_initial_learning = (p_val.is_new_destination == 1 && s_val.packet_count >= 30); //학습 중인지 아닌지를 1 /0 
+        bool is_overflow_prevent = (s_val.packet_count >= 10000); // 1,000개 패킷 단위로 리셋 해야하기에 1,000개 이상 1 아니면 0
+
+        if (is_initial_learning || is_overflow_prevent) { //둘중 하나라도 참이면 업데이트
             
-            // 이제 충분히 지켜봤으니 통계를 기반으로 '감시 모드' 전환
+            // --- [통계 계산 시작] ---
             double n = (double)s_val.packet_count;
-            double mean = (double)s_val.total_bytes / n;
-            double variance = ((double)s_val.total_sq_bytes / n) - (mean * mean);
-            double std_dev = sqrt(variance < 0 ? 0 : variance);
             
-            // 3시그마 임계치 계산
-            p_val.max_packet_size = (unsigned long long)(mean + (3 * std_dev));
-            
-            // 상태 전환: White(2) -> Gray(1) 및 학습 완료(0) 표시
-            p_val.trust_level = 1; 
-            p_val.is_new_destination = 0; 
-            p_val.sample_rate = 100; // 감시 모드로 들어갔으니 샘플링 빈도를 낮춤
+            // 1. 패킷 크기 기반 3시그마 계산
+            double mean_size = (double)s_val.total_bytes / n;
+            double var_size = ((double)s_val.total_sq_bytes / n) - (mean_size * mean_size);
+            double std_dev = sqrt(var_size < 0 ? 0 : var_size);
+            p_val.max_packet_size = (unsigned long long)(mean_size + (3 * std_dev));
 
-            bpf_map_update_elem(policy_fd, &cur_key, &p_val, BPF_ANY);
+            // 2. 전송량(BPS) 및 빈도(PPS) 계산
+            double total_duration_sec = (double)s_val.interval_sum / 1e9;
+            if (total_duration_sec < 0.001) total_duration_sec = 0.001;
 
-            printf("\n\033[1;32m[Learning Complete]\033[0m Session PID:%u established profile.\n", cur_key.pid);
-            printf("  > Normal Size Range: up to %llu bytes. \033[1;33mMonitoring Started.\033[0m\n", p_val.max_packet_size);
+            double avg_bps = (double)s_val.total_bytes / total_duration_sec;
+            double avg_pps = (double)s_val.packet_count / total_duration_sec;
+
+            // 변동 계수(CV)를 활용한 동적 마진 계산, 즉 변동이 많으면 그 값을 반영해서 처리
+            double cv = (mean_size > 0) ? (std_dev / mean_size) : 0;
+            double dynamic_margin = 1.5 + (cv * 1.0);
+            if (dynamic_margin > 5.0) dynamic_margin = 5.0;
+
+            p_val.max_bytes_per_sec = (unsigned long long)(avg_bps * dynamic_margin);
+            p_val.max_packets_per_sec = (unsigned int)(avg_pps * dynamic_margin);
+            // --- [통계 계산 종료] ---
+
+            // 상태 변경 로직
+            if (is_initial_learning) {
+                p_val.trust_level = 1; // Gray 등급 강등
+                p_val.is_new_destination = 0;
+                p_val.sample_rate = 100;
+                printf("\n\033[1;32m[Learning Complete]\033[0m Session PID:%u (New Profile)\n", cur_key.pid);
+            } else {
+                printf("\n\033[1;34m[Stats Refresh]\033[0m Session PID:%u (Overflow Prevention)\n", cur_key.pid);
+            }
+
+            // 정책 업데이트 및 통계 맵 리셋
+            bpf_map_update_elem(policy_fd, &cur_key, &p_val, BPF_ANY); //정책 업데이트
+            bpf_map_update_elem(stats_fd, &cur_key, &zero_stats, BPF_ANY); // 여기서 초기화
+
+            printf("  > Max Packet Size : %llu bytes\n", p_val.max_packet_size);
+            printf("  > Max Throughput  : %llu bytes/sec (Margin: %.2fx)\n", p_val.max_bytes_per_sec, dynamic_margin);
+            printf("  > Max Frequency   : %u packets/sec\n", p_val.max_packets_per_sec);
         }
     }
 }
 
+// 종료된 프로세스를 확인하고 지우는 함수 (PID 재사용 방지 및 메모리 확보)
+void cleanup_stale_policies(struct aegis_bpf *skel) {
+    int stats_fd = bpf_map__fd(skel->maps.map_stats);
+    int policy_fd = bpf_map__fd(skel->maps.map_policy);
+    
+    struct stats_key cur_key = {}, next_key;
+    int deleted_count = 0;
+
+    // map_stats를 기준으로 전체 항목을 순회 (Key-Value 데이터베이스 스캔 방식)
+    while (bpf_map_get_next_key(stats_fd, &cur_key, &next_key) == 0) {
+        cur_key = next_key;
+
+        /* kill(pid, 0)의 의미:
+         * 실제로 시그널을 보내지 않고, 해당 PID가 살아있는지 커널에 확인 요청.
+         * 만약 반환값이 -1이고 errno가 ESRCH(No such process)라면 프로세스가 종료된 것임.
+         */
+        if (kill(cur_key.pid, 0) == -1 && errno == ESRCH) {
+            
+            // 1. 통계 맵에서 해당 PID 정보 삭제
+            bpf_map_delete_elem(stats_fd, &cur_key);
+            
+            // 2. 정책 맵에서 해당 PID 정보 삭제
+            bpf_map_delete_elem(policy_fd, &cur_key);
+
+            deleted_count++;
+        }
+    }
+
+    // 청소 결과 로그 (테스트용)
+    if (deleted_count > 0) {
+        printf("\033[1;34m[GC]\033[0m Cleaned up %d stale entries (Process terminated).\n", deleted_count);
+    }
+}
 
 // [메인 실행부]
 int main(int argc, char **argv) {
@@ -168,6 +225,11 @@ int main(int argc, char **argv) {
     struct ring_buffer *rb = NULL;
     int err, ifindex;
     const char *ifname = "ens33"; // 본인의 환경에 맞게 수정
+
+    // 실행 주기를 관리하기 위한 변수
+    time_t now;
+    time_t last_sync_time = 0;
+    time_t last_cleanup_time = 0;
 
     ifindex = if_nametoindex(ifname);
     if (ifindex == 0) { fprintf(stderr, "Interface %s not found\n", ifname); return 1; }
@@ -193,36 +255,51 @@ int main(int argc, char **argv) {
     if (err) goto cleanup;
 
     // 3. 링버퍼 초기화
-    rb = ring_buffer__new(bpf_map__fd(skel->maps.rb), handle_event, NULL, NULL);
+    // handle_event 함수에 skel을 전달하여 함수 내부에서 맵에 접근할 수 있게 합니다.
+    rb = ring_buffer__new(bpf_map__fd(skel->maps.rb), handle_event, skel, NULL);
     if (!rb) goto cleanup;
 
-    printf("\033[1;32m[Aegis-BPF Intelligence Engine Started]\033[0m\n");
+    printf("\n\033[1;32m[Aegis-BPF Intelligence Engine Started]\033[0m\n");
     printf("Monitoring traffic on %s... Press Ctrl+C to stop.\n", ifname);
 
-    // 4. 메인 분석 루프
+    // 4. 주요 동작 루프 처리
     while (!stop) {
-        // [A] 현실 시간 동기화 (커널 전역 변수 갱신)
-        time_t t = time(NULL);
-        skel->bss->current_hour = localtime(&t)->tm_hour;
-
-        // [B] 통계 분석 및 정책 피드백 (3-Sigma 학습)
-        sync_security_policies(skel);
-
-        // [C] 보안 이벤트 감시 (Ring Buffer Polling)
-        err = ring_buffer__poll(rb, 100);
+        // [A] 링버퍼 이벤트 감시 (가장 높은 우선순위)
+        err = ring_buffer__poll(rb, 100); 
         if (err < 0 && err != -EINTR) break;
 
-        usleep(500000); // 0.5초 주기로 정책 검토
+        now = time(NULL);
+
+        // [B] 현실 시간 및 정책 동기화 (1초 주기)
+        if (now - last_sync_time >= 1) {
+            // 커널 전역 변수(시간) 갱신 (이걸로 사용자 시간을 커널에 주입)
+            struct tm *tm_info = localtime(&now);
+            skel->bss->current_hour = tm_info->tm_hour;
+
+            // 통계 분석 및 3-Sigma 정책 피드백 실행
+            sync_security_policies(skel);
+            
+            last_sync_time = now;
+        }
+
+        // [C] 종료된 프로세스 정보 정리 (10초 주기)
+        // 종료된 프로세스를 확인하고 맵에서 제거하여 메모리 확보 및 PID 재사용 방지
+        if (now - last_cleanup_time >= 10) {
+            cleanup_stale_policies(skel);
+            last_cleanup_time = now;
+        }
+
+        // CPU 과점유 방지를 위한 미세 대기 (0.1초)
+        usleep(100000); 
     }
 
 // [종료 처리] 루프 탈출 시 자원 정리 및 TC 필터 해제
 cleanup:
     printf("\n\033[1;33m[Shutting down Aegis-BPF...]\033[0m\n");
-    // TC 필터 해제
-    opts.prog_fd = opts.prog_id = 0;
-    bpf_tc_detach(&hook, &opts);
-    
-    // 자원 반환
+    if (ifindex > 0) {
+        opts.prog_fd = opts.prog_id = 0;
+        bpf_tc_detach(&hook, &opts);
+    }
     ring_buffer__free(rb);
     aegis_bpf__destroy(skel);
     printf("Cleanup complete. Goodbye.\n");
