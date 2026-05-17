@@ -21,6 +21,49 @@
 static volatile bool stop = false;
 static void sig_handler(int sig) { stop = true; }
 
+// --- [추가된 부분: White/Black list 관리] ---
+#define MAX_LIST_ENTRIES 1024
+char whitelist[MAX_LIST_ENTRIES][16];
+int whitelist_count = 0;
+
+char blacklist[MAX_LIST_ENTRIES][16];
+int blacklist_count = 0;
+
+// 파일에서 리스트를 불러오는 함수
+void load_process_list(const char *filename, char list[][16], int *count) {
+    FILE *f = fopen(filename, "r");
+    if (!f) {
+        printf("\033[1;33m[Info]\033[0m %s file not found. Creating a blank one.\n", filename);
+        f = fopen(filename, "w");
+        if (f) fclose(f);
+        return;
+    }
+    
+    char line[256];
+    *count = 0;
+    while (fgets(line, sizeof(line), f) && *count < MAX_LIST_ENTRIES) {
+        line[strcspn(line, "\r\n")] = 0; // 줄바꿈 제거
+        if (strlen(line) > 0) {
+            strncpy(list[*count], line, 15);
+            list[*count][15] = '\0';
+            (*count)++;
+        }
+    }
+    fclose(f);
+    printf("[Info] Loaded %d entries from %s\n", *count, filename);
+}
+
+// 특정 프로세스 이름이 리스트에 있는지 확인하는 함수
+bool is_process_in_list(const char *comm, char list[][16], int count) {
+    for (int i = 0; i < count; i++) {
+        if (strncmp(comm, list[i], 16) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+// ----------------------------------------------
+
 // 헥스 덤프 헬퍼 함수 (페이로드 시각화)
 void print_hex_dump(const char *payload, int len) {
     printf("      [Payload Dump] ");
@@ -51,6 +94,7 @@ static int handle_event(void *ctx, void *data, size_t data_sz) {
     const struct event_t *e = data;
     struct aegis_bpf *skel = (struct aegis_bpf *)ctx; 
     char s_ip[INET_ADDRSTRLEN], d_ip[INET_ADDRSTRLEN];
+    char choice;
 
     inet_ntop(AF_INET, &e->saddr, s_ip, sizeof(s_ip));
     inet_ntop(AF_INET, &e->daddr, d_ip, sizeof(d_ip));
@@ -58,7 +102,7 @@ static int handle_event(void *ctx, void *data, size_t data_sz) {
 
     // 1. 샘플링 데이터(Reason 5) 처리: 정밀 분석 및 등급 강등 (주기적으로 시행)
     if (e->reason == 5) {
-        double entropy = calculate_shannon_entropy(e->payload, 128);
+        double entropy = calculate_entropy(e->payload, 128);
 
         // 엔트로피 임계치(6.5) 초과 시: 신뢰 등급 강등 (Level 2 -> 1)
         if (entropy > 6.5) {
@@ -125,9 +169,49 @@ void sync_security_policies(struct aegis_bpf *skel) {
 
         if (bpf_map_lookup_elem(policy_fd, &cur_key, &p_val) != 0) {
             memset(&p_val, 0, sizeof(p_val));
-            p_val.trust_level = 2;          
-            p_val.is_new_destination = 1;   
-            p_val.sample_rate = 10;         
+
+	    // 프로세스 이름을 알아내기 위해 map_process 조회
+            char proc_name[16] = "unknown";
+            struct ip_port_key ip_key = { .dest_ip = cur_key.dest_ip, .dest_port = cur_key.dest_port };
+            struct process_info_value proc_val;
+            int proc_fd = bpf_map__fd(skel->maps.map_process);
+            
+            if (bpf_map_lookup_elem(proc_fd, &ip_key, &proc_val) == 0) {
+                strncpy(proc_name, proc_val.comm, 16);
+            } else {
+                // map_process에 없다면 /proc/<pid>/comm 에서 직접 읽기 (안전망)
+                char path[64];
+                snprintf(path, sizeof(path), "/proc/%u/comm", cur_key.pid);
+                FILE *f = fopen(path, "r");
+                if (f) {
+                    if (fgets(proc_name, sizeof(proc_name), f)) {
+                        proc_name[strcspn(proc_name, "\n")] = '\0';
+                    }
+                    fclose(f);
+                }
+            }
+
+            // 파일 리스트 대조 로직
+            if (is_process_in_list(proc_name, blacklist, blacklist_count)) {
+                // 블랙리스트 매칭: 즉시 차단, 학습하지 않음
+                p_val.trust_level = 0;
+                p_val.is_new_destination = 0; 
+                printf("\n\033[1;31m[!] Auto-Blacklisted by File:\033[0m %s (PID:%u). Traffic blocked.\n", proc_name, cur_key.pid);
+            } 
+            else if (is_process_in_list(proc_name, whitelist, whitelist_count)) {
+                // 화이트리스트 매칭: 즉시 신뢰, 학습하지 않음
+                p_val.trust_level = 2;          
+                p_val.is_new_destination = 0;   
+                p_val.sample_rate = 0; // 필요시 0이 아닌 다른 샘플링율로 수정 가능         
+                printf("\n\033[1;32m[+] Auto-Whitelisted by File:\033[0m %s (PID:%u). Traffic allowed.\n", proc_name, cur_key.pid);
+            } 
+            else {
+                // 리스트에 없으면 기존처럼 학습 모드 돌입
+                p_val.trust_level = 2;          
+                p_val.is_new_destination = 1;   
+                p_val.sample_rate = 10;         
+            }
+         
             bpf_map_update_elem(policy_fd, &cur_key, &p_val, BPF_ANY);
             continue;
         }
@@ -135,7 +219,7 @@ void sync_security_policies(struct aegis_bpf *skel) {
         // [학습 종료및 1,000개 패킷 단위로 map_stats 초기화]
         bool should_update = false;
         bool is_initial_learning = (p_val.is_new_destination == 1 && s_val.packet_count >= 30); //학습 중인지 아닌지를 1 /0 
-        bool is_overflow_prevent = (s_val.packet_count >= 10000); // 1,000개 패킷 단위로 리셋 해야하기에 1,000개 이상 1 아니면 0
+        bool is_overflow_prevent = (s_val.packet_count >= 1000); // 1,000개 패킷 단위로 리셋 해야하기에 1,000개 이상 1 아니면 0
 
         if (is_initial_learning || is_overflow_prevent) { //둘중 하나라도 참이면 업데이트
             
@@ -236,6 +320,11 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
+
+    // --- [추가된 부분: 리스트 파일 로드] ---
+    load_process_list("whitelist.txt", whitelist, &whitelist_count);
+    load_process_list("blacklist.txt", blacklist, &blacklist_count);
+    // -------------------------------------
 
     // 1. 메모리 제한 해제 및 스켈레톤 로드
     struct rlimit rlim = { RLIM_INFINITY, RLIM_INFINITY };
