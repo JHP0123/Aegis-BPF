@@ -147,6 +147,90 @@ static __always_inline void send_to_user(struct __sk_buff *skb, struct process_i
     bpf_ringbuf_submit(e, 0);
 }
 
+/* --- [TCP 용 Kprobe 로직: 패킷 전송 요청한 데이터 수집, map_process 처리] --- */
+SEC("kprobe/tcp_sendmsg")
+int bpf_prog_tcp_sendmsg(struct pt_regs *ctx)
+{
+	// tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
+	// kprobe는 어떤 함수가 실행될 때, CPU register 값을 가져온다. 
+	// 함수의 파라메타가 sk, msg, size이므로, 이들은 x86-64 기준 
+	// %rdi, %rsi, ... 에 저장이 되고, 이 register 값들의 정보를 가져온다. 
+	// PT_REGS_PARM1은 첫번째 register의 값을 가져오는데 이것이 socket 정보.
+	struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
+	if (!sk)
+		return 0;
+	
+	// key와 value 구조체를 다 0으로 초기화
+	struct ip_port_key key = {};
+	struct process_info_value val = {};
+
+	// PID, TID 추출
+	// 상위 32비트: TGID (process ID)
+	// 하위 32비트: PID (Thread ID)
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	val.pid = pid_tgid >> 32;
+	val.tid = (__u32)pid_tgid;
+
+	// 프로세스 이름 추
+	bpf_get_current_comm(&val.comm, sizeof(val.comm));
+
+	// destination port 추출
+	// struct sk 구조체는 TCP 연결 상태, 송신 큐, 윈도우 크기 등의 정보들을 가지고 있다. 
+	// sk->__sk_common에 IP와 port 정보들이 저장되어 있다. 
+	// sk->__sk_common.skc_daddr: dest IP
+	// sk->__sk_common.skc_dport: dest port
+	__u16 dport = 0;
+	bpf_probe_read_kernel(&dport, sizeof(dport), &sk->__sk_common.skc_dport);
+	key.dest_port = bpf_ntohs(dport);
+
+	// destination IP 추출
+	bpf_probe_read_kernel(&key.dest_ip, sizeof(key.dest_ip), &sk->__sk_common.skc_daddr);
+
+	// map에 저장
+	bpf_map_update_elem(&map_process, &key, &val, BPF_ANY);
+	
+	return 0;
+}
+
+/* --- [UDP 용 Kprobe 로직: 패킷 전송 요청한 데이터 수집, map_process 처리] --- */
+SEC("kprobe/udp_sendmsg")
+int bpf_prog_udp_sendmsg(struct pt_regs *ctx)
+{
+	// udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
+	// %rdi 레지스터(첫 번째 파라미터)에서 소켓 구조체 포인터를 가져옵니다.
+	struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
+	if (!sk)
+		return 0;
+	
+	struct ip_port_key key = {};
+	struct process_info_value val = {};
+
+	// PID, TID 추출
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	val.pid = pid_tgid >> 32;
+	val.tid = (__u32)pid_tgid;
+
+	// 프로세스 이름 추출
+	bpf_get_current_comm(&val.comm, sizeof(val.comm));
+
+	// destination port 추출 및 호스트 엔디안 변환 (TC 훅과 일치)
+	__u16 dport = 0;
+	bpf_probe_read_kernel(&dport, sizeof(dport), &sk->__sk_common.skc_dport);
+	key.dest_port = bpf_ntohs(dport);
+
+	// destination IP 추출
+	bpf_probe_read_kernel(&key.dest_ip, sizeof(key.dest_ip), &sk->__sk_common.skc_daddr);
+
+	// UDP 특성상 목적지 IP가 아직 지정되지 않은 빈 소켓(Disconnected 소켓)은 제외
+	if (key.dest_ip == 0)
+		return 0;
+
+	// 주소록(map_process)에 프로세스 정보 등록
+	bpf_map_update_elem(&map_process, &key, &val, BPF_ANY);
+	
+	return 0;
+}
+
 /* --- [메인 로직: TC 훅] --- */
 
 SEC("tc")
