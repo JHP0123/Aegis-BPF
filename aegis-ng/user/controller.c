@@ -75,7 +75,7 @@ void run_anomaly_engine(struct aegis_bpf *skel) {
             }
         }
 
-        bool is_dns = (ntohs(key.dport) == 53);
+        bool is_dns = (ntohs(key.dport) == 53 || ntohs(key.dport) == 11111);
 
         // ==========================================
         // [로직 1 & 3] 대용량 유출 및 DNS 터널링 탐지

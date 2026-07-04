@@ -87,7 +87,7 @@ int BPF_KPROBE(kprobe_tcp_close, struct sock *sk)
     key.sport = bpf_htons(sport);
 
     bpf_map_delete_elem(&map_process, &key);
-    bpf_map_delete_elem(&map_stats, &key);
+    //  bpf_map_delete_elem(&map_stats, &key);
     bpf_map_delete_elem(&map_enforcement, &key);
     return 0;
 }
