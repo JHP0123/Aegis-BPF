@@ -53,7 +53,9 @@ __eBPF 기반 실시간 커널 트래픽 분석 및 초경량 사용자 중심 �
 
 ### Bulk Exfiltration & DNS Tunneling
 - 지수 이동 평균(EMA)을 사용하여 트래픽의 연속적인 Byte Per-Second(BPS) 흐름을 추적
+
     $$EMA\_BPS = (0.2 \times \text{Current\_BPS}) + (0.8 \times \text{Previous\_EMA\_BPS})$$
+
     - 현재 BPS에 0.2의 가중치를 주고 현시점 직전까지 계산된 EMA_BPS에 0.8을 곱하여 현재 정보와 더불어 과거의 정보도 고려한 최종 EMA_BPS를 계산. 이를 통해 현시점만 보지 않고 과거부터 현재까지 해당 트래픽이 어떠한 특징을 가지는지를 표현.
 
 - 일반 트래픽과 DNS 트래픽의 임계치를 각각 설정하여 조건 초과 시 패킷을 Drop 하도록 map_enforcement에 플래그(flag = 1)를 적용.
