@@ -24,7 +24,7 @@ __eBPF 기반 실시간 커널 트래픽 분석 및 초경량 사용자 중심 �
 
 - Aegis-BPF는 Kernel Space와 User Space의 분리된 아키텍처로 구성
 
-<img src="img/arch.png" style="width: 80%;">
+- <아키텍처 그림>
 
 ### Kernel Space(데이터 수집 및 즉각 차단)
 
@@ -54,7 +54,7 @@ __eBPF 기반 실시간 커널 트래픽 분석 및 초경량 사용자 중심 �
 ### Bulk Exfiltration & DNS Tunneling
 - 지수 이동 평균(EMA)을 사용하여 트래픽의 연속적인 Byte Per-Second(BPS) 흐름을 추적
 
-    $$EMA\ BPS = (0.2 \times \text{Current BPS}) + (0.8 \times \text{Previous EMA BPS})$$
+    $$EMA\_BPS = (0.2 \times \text{Current\_BPS}) + (0.8 \times \text{Previous\_EMA\_BPS})$$
 
     - 현재 BPS에 0.2의 가중치를 주고 현시점 직전까지 계산된 EMA_BPS에 0.8을 곱하여 현재 정보와 더불어 과거의 정보도 고려한 최종 EMA_BPS를 계산. 이를 통해 현시점만 보지 않고 과거부터 현재까지 해당 트래픽이 어떠한 특징을 가지는지를 표현.
 
@@ -64,9 +64,9 @@ __eBPF 기반 실시간 커널 트래픽 분석 및 초경량 사용자 중심 �
 ### C2 Beaconing
 - IAT(Interval Arrival Time)를 기반으로 전송 주기의 오차를 계산하고, 분산과 변동계수(CV)를 도출하여 악성 비커닝의 주기성을 판별
 
-    - 오차 계산: $Diff = \Delta t - \text{Previous\ EMAinterval}$
+    - 오차 계산: $Diff = \Delta t - \text{Previous\_EMAinterval}$
     - 분산 업데이트: $EMAvariance = 0.8 \times (EMAvariance + 0.2 \times Diff^2)$ 
-    - 표준편차($\sigma$) 및 변동계수 계산: $CV = \frac{\sigma}{\text{Current\ EMAinterval}}$
+    - 표준편차($\sigma$) 및 변동계수 계산: $CV = \frac{\sigma}{\text{Current\_EMAinterval}}$
     - $CV < 0.10$인 경우, 일정한 주기성을 띄는 C2 비커닝으로 식별
 
 - 정상적인 트래픽인 경우 인간의 불규칙적인 패턴으로 인해 CV가 0.1을 충분하게 초과하지만, 프로그래밍된 악성 트래픽들은 기계적 주기성을 띄우므로 CV가 정상 트래픽보다 낮게 측정되는 특징을 이용
@@ -113,10 +113,24 @@ __eBPF 기반 실시간 커널 트래픽 분석 및 초경량 사용자 중심 �
 - 시스템 병목의 주원인인 0번 코어의 집중 부하율을 70.0%에서 61.6%로 낮추어 약 8.4% 경감
 - 상용 솔루션이 유저 영역 처리를 위해 구동하는 10~13개의 보안 전용 스레드 오버헤드를 제거
 
+<img src="img/1.png" style="width: 80%;">
+<p align="center"><b>OpenSnitch</b></p>
+
+<img src="img/2.png" style="width: 80%;">
+<p align="center"><b>Aegis-BPF</b></p>
+
 ### Throughput
 - 3회 반복 측정 평균 대역폭이 928.3 Mbps에서 962.3 Mbps로 향상(약 3.6%)
 - 임계 부하 상황에서의 최저 대역폭을 717 Mbps로 방어
 
+<img src="img/3.png" style="width: 80%;">
+<p align="center"><b>OpenSnitch</b></p>
+
+<img src="img/4.png" style="width: 80%;">
+<p align="center"><b>Aegis-BPF</b></p>
+
 ### Latency
 - 커널 수준 패킷 처리로 평균 응답 속도 18.46% 개선
 - 최대 병목 지연(Tail Latency) 26.54% 개선
+
+<img src="img/5.png" style="width: 80%;">
