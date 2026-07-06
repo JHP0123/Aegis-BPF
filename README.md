@@ -64,9 +64,9 @@ __eBPF 기반 실시간 커널 트래픽 분석 및 초경량 사용자 중심 �
 ### C2 Beaconing
 - IAT(Interval Arrival Time)를 기반으로 전송 주기의 오차를 계산하고, 분산과 변동계수(CV)를 도출하여 악성 비커닝의 주기성을 판별
 
-    - 오차 계산: $Diff = \Delta t - \text{Previous\_EMAinterval}$
+    - 오차 계산: $Diff = \Delta t - \text{Previous\ EMAinterval}$
     - 분산 업데이트: $EMAvariance = 0.8 \times (EMAvariance + 0.2 \times Diff^2)$ 
-    - 표준편차($\sigma$) 및 변동계수 계산: $CV = \frac{\sigma}{\text{Current\_EMAinterval}}$
+    - 표준편차($\sigma$) 및 변동계수 계산: $CV = \frac{\sigma}{\text{Current\ EMAinterval}}$
     - $CV < 0.10$인 경우, 일정한 주기성을 띄는 C2 비커닝으로 식별
 
 - 정상적인 트래픽인 경우 인간의 불규칙적인 패턴으로 인해 CV가 0.1을 충분하게 초과하지만, 프로그래밍된 악성 트래픽들은 기계적 주기성을 띄우므로 CV가 정상 트래픽보다 낮게 측정되는 특징을 이용
