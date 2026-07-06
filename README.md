@@ -24,7 +24,7 @@ __eBPF 기반 실시간 커널 트래픽 분석 및 초경량 사용자 중심 �
 
 - Aegis-BPF는 Kernel Space와 User Space의 분리된 아키텍처로 구성
 
-- <아키텍처 그림>
+<img src="img/arch.png" style="width: 80%;">
 
 ### Kernel Space(데이터 수집 및 즉각 차단)
 
