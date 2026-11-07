@@ -100,6 +100,7 @@ server(window): https://github.com/user-attachments/assets/0a4ff4b7-b035-4d67-a8
 <img src="img/sliver-C2.png" style="width: 80%;">
 
 데모 영상
+
 https://github.com/user-attachments/assets/1c991946-fca7-4fa5-92e4-0dba89980463
 
 ### Bulk-Exfilteration
@@ -112,7 +113,11 @@ https://github.com/user-attachments/assets/1c991946-fca7-4fa5-92e4-0dba89980463
     - __보안 격리__: 리눅스의 cgroup이나 네임스페이스 제어와 연동하여, 악성 행위를 일으킨 컨테이너나 프로세스를 즉시 네트워크 환경에서 격리하는 능동적 대응이 가능
 
 <img src="img/bulk.png" style="width: 80%;">
-<영상>
+
+데모영상
+
+https://github.com/user-attachments/assets/83cd1d47-c1b1-4c3f-9f63-d06a9ef222aa
+
 
 ## 6. Performance Evaluation
 
