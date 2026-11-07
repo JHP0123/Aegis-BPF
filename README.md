@@ -1,5 +1,11 @@
 
 
+https://github.com/user-attachments/assets/0a4ff4b7-b035-4d67-a884-859f9fefd659
+
+
+
+
+
 
 
 # Aegis-BPF
@@ -83,7 +89,10 @@ __eBPF 기반 실시간 커널 트래픽 분석 및 초경량 사용자 중심 �
     - DNS 프로토콜을 통해 암호화된 C&C 터널을 생성하도록 설계된 도구
 
 <img src="img/dnscat2.png" style="width: 80%;">
-<영상>
+
+데모영상
+client(ubuntu): https://github.com/user-attachments/assets/0a4ff4b7-b035-4d67-a884-859f9fefd659
+server(window): https://github.com/user-attachments/assets/0a4ff4b7-b035-4d67-a884-859f9fefd659
 
 ### C2 Beaconing
 
