@@ -1,6 +1,12 @@
 
 
 
+https://github.com/user-attachments/assets/699153c1-92d4-4897-9e8b-9b8e9bf51e25
+
+
+
+
+
 
 
 
@@ -94,7 +100,7 @@ https://github.com/user-attachments/assets/0a4ff4b7-b035-4d67-a884-859f9fefd659
 
 server(window)
 
-https://github.com/user-attachments/assets/0a4ff4b7-b035-4d67-a884-859f9fefd659
+https://github.com/user-attachments/assets/699153c1-92d4-4897-9e8b-9b8e9bf51e25
 
 ### C2 Beaconing
 
