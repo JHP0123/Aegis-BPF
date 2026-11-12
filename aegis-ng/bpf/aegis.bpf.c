@@ -36,10 +36,10 @@ struct {
     __type(value, __u8);
 } map_enforcement SEC(".maps");
 
-struct {
-    __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 256 * 1024);
-} rb_alerts SEC(".maps");
+// struct {
+//     __uint(type, BPF_MAP_TYPE_RINGBUF);
+//     __uint(max_entries, 256 * 1024);
+// } rb_alerts SEC(".maps");
 
 
 /* --- [Hooks] --- */
@@ -126,10 +126,17 @@ int bpf_tc_egress(struct __sk_buff *skb)
 
     // 1. 차단 정책 확인
     __u8 *enforce_action = bpf_map_lookup_elem(&map_enforcement, &key);
+    if (!enforce_action) {
+        // 2차: 출발지 와일드카드 매칭 (saddr=0, sport=0 - C2 비코닝 차단용)
+        struct flow_key wildcard_key = {};
+        wildcard_key.daddr = key.daddr;
+        wildcard_key.dport = key.dport;
+        enforce_action = bpf_map_lookup_elem(&map_enforcement, &wildcard_key);
+    }
     if (enforce_action && *enforce_action == 1) {
         return TC_ACT_SHOT;
     }
-
+    
     // 2. 통계 수집
     struct aegis_flow_stats *stats = bpf_map_lookup_elem(&map_stats, &key);
     if (!stats) {
