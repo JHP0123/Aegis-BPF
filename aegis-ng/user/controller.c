@@ -115,8 +115,8 @@ void run_anomaly_engine(struct aegis_bpf *skel) {
 
                 if (is_dns) {
                     // DNS는 UDP이므로 프로세스 이름 대신 시스템 태그 부착
-                    printf("\033[1;33m[BLOCK] DNS Tunneling Detected\033[0m | System (UDP) -> %s:53 | BPS: %.0f\n", 
-                           dest_ip, tracker[track_idx].ema_tx_bps);
+                    printf("\033[1;33m[BLOCK] DNS Tunneling Detected\033[0m | System (UDP) -> %s:%u | BPS: %.0f\n", 
+                           dest_ip, ntohs(key.dport), tracker[track_idx].ema_tx_bps);
                 } else {
                     if (bpf_map_lookup_elem(proc_fd, &key, &proc) != 0) {
                         struct flow_key lookup_key = key;
@@ -179,13 +179,15 @@ void run_anomaly_engine(struct aegis_bpf *skel) {
                             print_ip(key.daddr, dest_ip);
 
                             if (is_dns) {
-                                printf("\033[1;36m[BLOCK] DNS Beaconing Detected\033[0m | System (UDP) -> %s:53 | Interval: %.2fs (CV: %.3f)\n", 
-                                       dest_ip, d_tracker[d_idx].ema_interval, cv);
+                                printf("\033[1;36m[BLOCK] DNS Beaconing Detected\033[0m | System (UDP) -> %s:%u | Interval: %.2fs (CV: %.3f)\n", 
+                                       dest_ip, ntohs(key.dport), d_tracker[d_idx].ema_interval, cv);
                             } else {
                                 struct aegis_process_info proc = {};
-                                struct flow_key lookup_key = key;
-                                lookup_key.saddr = 0;
-                                bpf_map_lookup_elem(proc_fd, &lookup_key, &proc);
+                                if (bpf_map_lookup_elem(proc_fd, &key, &proc) != 0) {
+                                    struct flow_key lookup_key = key;
+                                    lookup_key.saddr = 0;
+                                    bpf_map_lookup_elem(proc_fd, &lookup_key, &proc);
+                                }
                                 
                                 printf("\033[1;35m[BLOCK] C2 Beaconing Detected\033[0m | PID: %u (%s) -> %s:%u | Interval: %.2fs (CV: %.3f)\n", 
                                        proc.pid, proc.comm, dest_ip, ntohs(key.dport), d_tracker[d_idx].ema_interval, cv);
